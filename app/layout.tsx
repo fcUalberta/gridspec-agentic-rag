@@ -13,7 +13,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: 'GridSpec — RFQ Compliance Workspace',
+  title: 'GridSpec | RFQ Compliance Workspace',
   description: 'Engineer-controlled requirements extraction, product compliance, and cohesive bid solution workspace.',
 };
 
