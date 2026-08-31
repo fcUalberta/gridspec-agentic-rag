@@ -1,130 +1,174 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import './cohesive.css';
 
-type Status = 'Approved' | 'Needs review' | 'Flagged';
-type Requirement = {
-  id: string; section: string; text: string; source: string; page: number;
-  status: Status; confidence: number; category: string; criticality: string;
-  quote: string; tags: string[];
-};
+type DocumentRow={id:string;kind:'rfq'|'product';file_name:string;byte_size:number;status:string;error?:string|null};
+type Requirement={id:string;requirement_key:string;section:string;requirement_text:string;source_quote:string;page_number:number|null;category:string;criticality:string;confidence:number;review_status:string;solution_package:string;package_order:number;subcategory:string;subcategory_order:number;compliance_object:string;requirement_type:string;lifecycle_phase:string;evidence_scope:string;expected_evidence:string;manual_match_applicable:number;classification_version:string};
+type Evidence={file_name:string;quote:string;location:string};
+type Assessment={id:string;requirement_id:string;decision:string;product_name:string;rationale:string;evidence:Evidence[];alternate:{product_name:string;rationale:string}|null;confidence:number;review_status:string;evaluation_method:string};
+type Solution={name:string;summary:string;bill_of_material:Array<{item:string;product:string;quantity:number;purpose:string}>;cohesion_checks:Array<{interface:string;status:string;finding:string}>;assumptions:string[];deviations:string[]};
+type ExtractionJob={id:string;document_id:string;pipeline_version:string;status:'queued'|'running'|'failed'|'interrupted'|'completed';total_batches:number;completed_batches:number;failed_batches:number;requirements_found:number;progress_percent:number;active_batches:number;pending_batches:number;current_page_range:string|null;error:string|null};
+type ComplianceJob={id:string;pipeline_version:string;status:'queued'|'running'|'failed'|'interrupted'|'completed';total_batches:number;completed_batches:number;failed_batches:number;total_requirements:number;completed_requirements:number;deterministic_unknowns:number;ollama_evaluations:number;fireworks_escalations:number;progress_percent:number;active_batches:number;pending_batches:number;current_batch:number|null;error:string|null;stale?:boolean};
 
-const requirements: Requirement[] = [
-  { id:'REQ-069-014', section:'TS.03.5', text:'Provide independent Primary A and Primary B protection schemes using permissive overreaching transfer trip (POTT).', source:'Protection & Control', page:79, status:'Approved', confidence:98, category:'Protection', criticality:'Mandatory', quote:'The line protection shall comprise two independent protection schemes designated Primary A and Primary B, both utilizing POTT logic.', tags:['POTT','Redundancy','Line protection'] },
-  { id:'REQ-069-015', section:'TS.03.5.1', text:'Each scheme shall provide four-zone phase and ground distance protection.', source:'Protection & Control', page:79, status:'Needs review', confidence:96, category:'Protection', criticality:'Mandatory', quote:'Each main protection relay shall provide a minimum of four zones of phase and ground distance protection.', tags:['ANSI 21','ANSI 21N','Numerical relay'] },
-  { id:'REQ-069-018', section:'TS.03.3', text:'Integrate panel IEDs with the station control system using DNP3 communications.', source:'SCADA & Comms', page:77, status:'Approved', confidence:99, category:'Communications', criticality:'Mandatory', quote:'All intelligent electronic devices shall communicate with the existing station control system using DNP3.', tags:['DNP3','SCADA','IED'] },
-  { id:'REQ-069-022', section:'TS.02.9', text:'Equipment shall withstand salt-laden air, dust, 100% relative humidity and 40 °C ambient temperature.', source:'Environmental', page:72, status:'Flagged', confidence:83, category:'Environment', criticality:'Mandatory', quote:'The equipment shall be suitable for tropical marine conditions including salt laden atmosphere, dust, 100% humidity and ambient temperatures up to 40°C.', tags:['Environmental','Tropical','Enclosure'] },
-  { id:'REQ-069-027', section:'TS.05.4', text:'Provide FT-1 or approved equivalent test switches for relay current and voltage circuits.', source:'Panel Construction', page:92, status:'Needs review', confidence:94, category:'Panel', criticality:'Mandatory', quote:'Test facilities shall be provided using FT-1 test switches or an approved equivalent.', tags:['Test switch','FT-1','Wiring'] },
-];
+const stages=['Sources','Requirements','Compliance','Solution','Outputs'];
+const SUBCATEGORY_PAGE_SIZE=20;
+const ASSESSMENTS_PER_PAGE=20;
+const PIPELINE_API=process.env.NEXT_PUBLIC_PIPELINE_API_URL||'http://127.0.0.1:8000';
 
-const stages = ['Intake','Requirements','Compliance','Solution','Outputs'];
+export default function Home(){
+  const [stage,setStage]=useState(0);const [configured,setConfigured]=useState<boolean|null>(null);const [strategyReady,setStrategyReady]=useState<boolean|null>(null);const [model,setModel]=useState<string|null>(null);
+  const [docs,setDocs]=useState<DocumentRow[]>([]);const [requirements,setRequirements]=useState<Requirement[]>([]);const [assessments,setAssessments]=useState<Assessment[]>([]);const [solution,setSolution]=useState<Solution|null>(null);const [extraction,setExtraction]=useState<ExtractionJob|null>(null);const [complianceJob,setComplianceJob]=useState<ComplianceJob|null>(null);
+  const [busy,setBusy]=useState('');const [error,setError]=useState('');const [message,setMessage]=useState('');const [selected,setSelected]=useState<Requirement|null>(null);const [note,setNote]=useState('');
+  const [selectedPackage,setSelectedPackage]=useState('');
+  const [subcategoryPages,setSubcategoryPages]=useState<Record<string,number>>({});
+  const [assessmentPage,setAssessmentPage]=useState(1);
+  const assessmentCountRef=useRef(0);
+  const rfqs=docs.filter(d=>d.kind==='rfq');const manuals=docs.filter(d=>d.kind==='product');const currentExtraction=extraction&&extraction.document_id===rfqs[0]?.id?extraction:null;
+  const extractionReady=currentExtraction?.status==='completed';
+  const extractionId=extraction?.id;const extractionStatus=extraction?.status;
+  const complianceId=complianceJob?.id;const complianceStatus=complianceJob?.status;
 
-const stageContent = {
-  0: { eyebrow:'Project intake', title:'Create the evidence workspace', body:'Upload the customer RFQ and product manuals. GridSpec preserves the originals, indexes technical evidence, and separates source facts from model interpretation.' },
-  2: { eyebrow:'Engineer checkpoint 2 of 4', title:'Validate compliance decisions', body:'Review exact catalog evidence, matching logic, gaps, and proposed alternates before the solution is assembled.' },
-  3: { eyebrow:'Engineer checkpoint 3 of 4', title:'Review the cohesive panel solution', body:'Resolve interface conflicts across relays, test facilities, communications, DC supply, panel construction, and engineering services.' },
-  4: { eyebrow:'Final approval', title:'Approve bid-ready outputs', body:'Publish an auditable compliance matrix, bill of material, deviation schedule, evidence pack, and engineering assumptions.' },
-} as const;
+  const api=useCallback(async(path:string,init?:RequestInit)=>{const response=await fetch(`${PIPELINE_API}${path.replace('/api/pipeline','')}`,init);const data=await response.json();if(!response.ok)throw new Error(data.detail||data.error||'Pipeline request failed.');setError('');return data},[]);
+  const refresh=useCallback(async()=>{try{const [s,d,r,c,so,x,cj]=await Promise.all([api('/api/pipeline/status'),api('/api/pipeline/documents'),api('/api/pipeline/requirements'),api('/api/pipeline/compliance'),api('/api/pipeline/solution'),api('/api/pipeline/extractions/latest'),api('/api/pipeline/compliance/jobs/latest')]);setConfigured(s.configured);setStrategyReady(Boolean(s.extraction_strategy));setModel(s.model);setDocs(d.documents);setRequirements(r.requirements);setAssessments(c.assessments);assessmentCountRef.current=c.assessments.length;setSolution(so.solution?.data||null);setExtraction(x.job||null);setComplianceJob(cj.job||null)}catch(e){setError(e instanceof Error?e.message:'Unable to load pipeline state.')}},[api]);
+  useEffect(()=>{const timer=window.setTimeout(()=>void refresh(),0);return()=>window.clearTimeout(timer)},[refresh]);
+  useEffect(()=>{if(!extractionId||!extractionStatus||!['queued','running'].includes(extractionStatus))return;const poll=async()=>{try{const result=await api(`/api/pipeline/extractions/${extractionId}`);setExtraction(result.job);if(!['queued','running'].includes(result.job.status))await refresh()}catch(e){setError(e instanceof Error?e.message:'Unable to read extraction progress.')}};const timer=window.setInterval(()=>void poll(),2000);return()=>window.clearInterval(timer)},[api,extractionId,extractionStatus,refresh]);
+  useEffect(()=>{if(!complianceId||!complianceStatus||!['queued','running'].includes(complianceStatus))return;const poll=async()=>{try{const result=await api(`/api/pipeline/compliance/jobs/${complianceId}`);setComplianceJob(result.job);if(result.job.completed_requirements!==assessmentCountRef.current){const decisions=await api('/api/pipeline/compliance');setAssessments(decisions.assessments);assessmentCountRef.current=decisions.assessments.length}if(!['queued','running'].includes(result.job.status))await refresh()}catch(e){setError(e instanceof Error?e.message:'Unable to read compliance progress.')}};const timer=window.setInterval(()=>void poll(),2500);return()=>window.clearInterval(timer)},[api,complianceId,complianceStatus,refresh]);
 
-export default function Home() {
-  const [selectedId, setSelectedId] = useState(requirements[1].id);
-  const [filter, setFilter] = useState<'All' | Status>('All');
-  const [query, setQuery] = useState('');
-  const [note, setNote] = useState('Confirm whether four independent distance zones are required in both relay schemes.');
-  const [toast, setToast] = useState('');
-  const [activeStage, setActiveStage] = useState(1);
-  const selected = requirements.find((r) => r.id === selectedId)!;
-  const visible = useMemo(() => requirements.filter((r) => (filter === 'All' || r.status === filter) && `${r.id} ${r.text} ${r.tags.join(' ')}`.toLowerCase().includes(query.toLowerCase())), [filter, query]);
+  async function run(label:string,action:()=>Promise<unknown>,after?:()=>void){setBusy(label);setError('');setMessage('');try{await action();await refresh();setMessage(`${label} completed successfully.`);after?.()}catch(e){setError(e instanceof Error?e.message:`${label} failed.`)}finally{setBusy('')}}
+  async function upload(file:File,kind:'rfq'|'product'){const body=new FormData();body.append('file',file);body.append('kind',kind);await run(kind==='rfq'?'Uploading RFQ':'Indexing product manual',()=>api('/api/pipeline/documents',{method:'POST',body}))}
+  async function startExtraction(documentId:string,force=false){setBusy('Starting requirement extraction');setError('');setMessage('');const body=new URLSearchParams({documentId,force:String(force)});try{const result=await api('/api/pipeline/extract',{method:'POST',body});setExtraction(result.job);setMessage(result.job.status==='completed'?'Extraction is already complete.':'Extraction started in the background. You can leave this page and return later.')}catch(e){setError(e instanceof Error?e.message:'Unable to start extraction.')}finally{setBusy('')}}
+  async function startCompliance(force=false){setBusy('Starting controlled compliance');setError('');setMessage('');try{const result=await api(`/api/pipeline/compliance?force=${force}`,{method:'POST'});setComplianceJob(result.job);if(force){setAssessments([]);assessmentCountRef.current=0;setAssessmentPage(1)}setMessage(result.job.status==='completed'?'Compliance analysis is already complete.':'Compliance started in the background and can resume after a restart.')}catch(e){setError(e instanceof Error?e.message:'Unable to start compliance analysis.')}finally{setBusy('')}}
+  async function saveRequirement(req:Requirement){await run(`Saving ${req.requirement_key}`,()=>api('/api/pipeline/requirements',{method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify({id:req.id,requirementText:req.requirement_text,reviewStatus:'Edited',note})}));setSelected(null);setNote('')}
+  const packageGroups=useMemo(()=>groupRequirements(requirements),[requirements]);
+  const activePackage=packageGroups.find(group=>group.name===selectedPackage)||packageGroups[0]||null;
+  const coverage=useMemo(()=>requirements.length?Math.round(assessments.length/requirements.length*100):0,[requirements,assessments]);
 
-  const act = (message: string) => {
-    setToast(message);
-    const event = { entityType: stages[activeStage].toLowerCase(), entityId: selectedId, decision: message, note, reviewer: 'Alex Morgan', at: new Date().toISOString() };
-    const audit = JSON.parse(window.localStorage.getItem('gridspec-audit') || '[]') as unknown[];
-    window.localStorage.setItem('gridspec-audit', JSON.stringify([...audit, event]));
-    void fetch('/api/reviews',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(event)}).catch(()=>undefined);
-    window.setTimeout(() => setToast(''), 2400);
-  };
+  return <main className="live-shell">
+    <aside className="live-nav"><div className="live-brand"><span>G</span><div><strong>GridSpec</strong><small>Live RFQ intelligence</small></div></div><nav>{stages.map((s,i)=><button key={s} className={stage===i?'active':''} onClick={()=>setStage(i)}><i>{i+1}</i>{s}<small>{i===0?`${docs.length} sources`:i===1?`${requirements.length} extracted`:i===2?`${assessments.length} decisions`:i===3?(solution?'Generated':'Pending'):'Bid package'}</small></button>)}</nav><div className={`model-state ${configured?'connected':'missing'}`}><span>{configured?'●':'!'}</span><div><strong>{configured?'Model connected':'Model key required'}</strong><small>{configured?model:'FIREWORKS_API_KEY missing'}</small></div></div></aside>
+    <section className="live-main"><header><div><small>Live project</small><h1>RFQ compliance workspace</h1></div><div className="live-summary"><span><b>{requirements.length}</b> requirements</span><span><b>{coverage}%</b> assessed</span></div></header>
+      <div className="live-stagebar">{stages.map((s,i)=><button key={s} className={stage===i?'active':''} onClick={()=>setStage(i)}><span>{i<stage?'✓':i+1}</span>{s}</button>)}</div>
+      {!configured&&<div className="key-warning"><strong>Real processing is not yet enabled</strong><p>Start the Python backend and add <code>FIREWORKS_API_KEY</code> to <code>backend/.env</code>. This application will not create placeholder requirements or compliance results.</p></div>}
+      {configured&&strategyReady===false&&<div className="key-warning"><strong>Restart the Python API to activate controlled extraction</strong><p>The UI has updated, but the running backend is still the legacy version. Stop the current demo and run <code>./run-demo.sh</code> before starting another extraction.</p></div>}
+      {error&&<div className="pipeline-alert error"><strong>Pipeline stopped</strong><p>{error}</p></div>}{message&&<div className="pipeline-alert success">{message}</div>}{busy&&<div className="pipeline-running"><span></span><div><strong>{busy}</strong><small>Preparing the persisted background job.</small></div></div>}
+      {currentExtraction&&<div className={`extraction-progress ${currentExtraction.status} ${currentExtraction.status==='running'&&currentExtraction.completed_batches===0?'awaiting-first':''}`}><div className="progress-copy"><strong>{currentExtraction.status==='completed'?'Requirement extraction complete':currentExtraction.status==='failed'?'Extraction paused after a batch failure':currentExtraction.status==='interrupted'?'Extraction interrupted — ready to resume':currentExtraction.completed_batches===0?'Local parsing and candidate analysis are running':'Requirement extraction in progress'}</strong><small>{currentExtraction.completed_batches===0&&currentExtraction.status==='running'?`${currentExtraction.active_batches} controlled batches active · model interpretation is used only for ambiguous candidates`:`${currentExtraction.completed_batches} of ${currentExtraction.total_batches} batches complete · ${currentExtraction.requirements_found} candidate requirements${currentExtraction.current_page_range?` · processing pages ${currentExtraction.current_page_range}`:''}`}</small>{currentExtraction.error&&<em>{currentExtraction.error}</em>}</div><div className="progress-value"><b>{currentExtraction.progress_percent}%</b><span><i style={{width:`${currentExtraction.progress_percent}%`}}></i></span></div></div>}
 
-  return (
-    <main className="shell">
-      <aside className="sidebar">
-        <div className="brand"><span className="brand-mark">G</span><div><strong>GridSpec</strong><small>Bid intelligence</small></div></div>
-        <nav aria-label="Main navigation">
-          <p>Workspace</p>
-          {['▦  Projects','▣  Product catalog','▤  Evidence library','◇  Rule sets'].map((item, i) => <button key={item} className={i===0?'active':''}>{item}</button>)}
-          <p>Governance</p>
-          {['◫  Audit trail','⚙  Settings'].map((item) => <button key={item}>{item}</button>)}
-        </nav>
-        <div className="profile"><span>AM</span><div><strong>Alex Morgan</strong><small>Protection engineer</small></div><b>⋯</b></div>
-      </aside>
+      {stage===0&&<section className="live-content"><div className="live-title"><span>Step 1</span><h2>Add real source documents</h2><p>RFQs are parsed locally with page-level citations; the model reviews only ambiguous candidates. Product manuals are indexed into a dedicated vector store for evidence retrieval.</p></div><div className="upload-grid"><UploadCard title="Customer RFQ" description="Upload the specification to extract atomic requirements with quotations and page references." action="Upload RFQ PDF" disabled={!!busy||!configured||strategyReady===false} onFile={f=>upload(f,'rfq')}/><UploadCard title="Product manual" description="Upload each catalog or instruction manual that may support a compliance claim." action="Index manual PDF" disabled={!!busy||!configured} onFile={f=>upload(f,'product')}/></div><div className="source-list"><h3>Evidence workspace</h3>{docs.length===0?<Empty text="No documents have been processed."/>:docs.map(d=><div className="source-item" key={d.id}><span>{d.kind==='rfq'?'RFQ':'MAN'}</span><div><strong>{d.file_name}</strong><small>{d.kind==='rfq'?'Customer requirement source':'Product evidence'} · {(d.byte_size/1024/1024).toFixed(1)} MB</small></div><i>{d.status}</i></div>)}</div>{rfqs.length>0&&currentExtraction?.status!=='completed'&&<button className="run-button" disabled={!!busy||!configured||strategyReady===false||currentExtraction?.status==='queued'||currentExtraction?.status==='running'} onClick={()=>startExtraction(rfqs[0].id)}>{strategyReady===false?'Restart Python API first':currentExtraction&&['failed','interrupted'].includes(currentExtraction.status)?'Run controlled extraction':'Extract requirements from '+rfqs[0].file_name+' →'}</button>}{currentExtraction?.status==='completed'&&<><button className="run-button" onClick={()=>setStage(1)}>Review {currentExtraction.requirements_found} requirements →</button><button className="run-button secondary" disabled={!!busy||strategyReady===false} onClick={()=>startExtraction(rfqs[0].id,true)}>Re-extract with improved pipeline</button></>}</section>}
 
-      <section className="workspace">
-        <header className="topbar">
-          <div><small>Projects / JPS 1025947</small><h1>69 kV line protection panel</h1></div>
-          <div className="top-actions"><button className="secondary" onClick={()=>act('Review snapshot prepared')}>Export review</button><button className="primary" onClick={()=>setActiveStage(Math.min(4,activeStage+1))}>{activeStage===4?'Publish outputs':`Continue to ${stages[Math.min(4,activeStage+1)].toLowerCase()}`} <span>→</span></button></div>
-        </header>
+      {stage===1&&<RequirementsWorkspace requirements={requirements} packageGroups={packageGroups} activePackage={activePackage} subcategoryPages={subcategoryPages} onSelectPackage={name=>{setSelectedPackage(name);setSubcategoryPages({})}} onSetPage={(key,page)=>setSubcategoryPages(current=>({...current,[key]:page}))} onEdit={requirement=>{setSelected(requirement);setNote('')}} onContinue={()=>setStage(2)}/>}
 
-        <div className="stagebar">
-          {stages.map((stage, i) => <button key={stage} onClick={()=>setActiveStage(i)} className={`stage ${i===activeStage?'current':''} ${i<activeStage?'done':''}`}><span>{i<activeStage?'✓':i+1}</span><div><small>{i===activeStage?(i===0?'Active':'Engineer checkpoint'):i<activeStage?'Complete':'Pending'}</small><b>{stage}</b></div></button>)}
-        </div>
+      {stage===2&&<ComplianceWorkspace requirements={requirements} assessments={assessments} complianceJob={complianceJob} extractionReady={extractionReady} manualsCount={manuals.length} busy={!!busy} configured={!!configured} assessmentPage={assessmentPage} onSetPage={setAssessmentPage} onStartCompliance={startCompliance} onReturnSources={()=>setStage(0)} onBuildSolution={()=>run('Cohesive solution generation',()=>api('/api/pipeline/solution',{method:'POST'}),()=>setStage(3))}/>}
 
-        {activeStage !== 1 ? <StageWorkspace stage={activeStage as 0|2|3|4} onAction={act} /> :
-        <div className="content">
-          <section className="main-panel">
-            <div className="checkpoint">
-              <div><span className="eyebrow">Engineer checkpoint 1 of 4</span><h2>Review extracted requirements</h2><p>Validate what the system found before product matching begins. Every edit is recorded in the audit trail.</p></div>
-              <div className="progress-ring"><strong>72%</strong><small>reviewed</small></div>
-            </div>
+      {stage===3&&<section className="live-content"><div className="live-title"><span>Engineer checkpoint 3</span><h2>Review the cohesive solution</h2><p>The solution is assembled from the extracted requirements and evidence-backed assessments. Unresolved interfaces remain visible.</p></div>{!solution?<Empty text="Complete compliance analysis and generate a solution."/>:<><div className="solution-hero"><span>Generated solution</span><h3>{solution.name}</h3><p>{solution.summary}</p></div><div className="solution-columns"><div><h3>Bill of material</h3>{solution.bill_of_material.map((b,i)=><div className="bom-live" key={i}><span>{b.quantity}</span><div><strong>{b.product}</strong><small>{b.item} · {b.purpose}</small></div></div>)}</div><div><h3>Interface and cohesion checks</h3>{solution.cohesion_checks.map((c,i)=><div className="check-live" key={i}><i className={c.status.toLowerCase()}>{c.status==='Pass'?'✓':'!'}</i><div><strong>{c.interface}</strong><small>{c.finding}</small></div></div>)}</div></div><div className="solution-notes"><div><h3>Assumptions</h3>{solution.assumptions.map((x,i)=><p key={i}>• {x}</p>)}</div><div><h3>Deviations</h3>{solution.deviations.map((x,i)=><p key={i}>• {x}</p>)}</div></div><button className="run-button" onClick={()=>setStage(4)}>Prepare bid outputs →</button></>}</section>}
 
-            <div className="metrics">
-              <div><small>Requirements</small><strong>64</strong><span>across 9 sections</span></div>
-              <div><small>Approved</small><strong className="green">46</strong><span>ready for matching</span></div>
-              <div><small>Needs review</small><strong className="amber">13</strong><span>engineer decision</span></div>
-              <div><small>Flagged</small><strong className="red">5</strong><span>possible ambiguity</span></div>
-            </div>
-
-            <div className="table-tools">
-              <label className="search">⌕ <input value={query} onChange={(e)=>setQuery(e.target.value)} placeholder="Search requirements, tags, IDs…" /></label>
-              <div className="filters">{(['All','Needs review','Flagged'] as const).map((f)=><button key={f} className={filter===f?'active':''} onClick={()=>setFilter(f)}>{f}</button>)}</div>
-              <button className="icon-button" aria-label="More filters">≡</button>
-            </div>
-
-            <div className="requirement-list">
-              <div className="table-head"><span>Requirement</span><span>Source</span><span>Status</span><span>Confidence</span></div>
-              {visible.map((r)=><button key={r.id} className={`requirement-row ${selectedId===r.id?'selected':''}`} onClick={()=>setSelectedId(r.id)}>
-                <span className="req-copy"><b>{r.id}</b><em>{r.section}</em><strong>{r.text}</strong><small>{r.tags.map(t=><i key={t}>{t}</i>)}</small></span>
-                <span className="source">{r.source}<small>Page {r.page}</small></span>
-                <span><i className={`status ${r.status.toLowerCase().replace(' ','-')}`}>{r.status}</i></span>
-                <span className="confidence"><b>{r.confidence}%</b><i><u style={{width:`${r.confidence}%`}} /></i></span>
-              </button>)}
-            </div>
-          </section>
-
-          <aside className="inspector">
-            <div className="inspector-head"><div><span className="eyebrow">Selected requirement</span><h3>{selected.id}</h3></div><button aria-label="Close inspector">×</button></div>
-            <div className="source-card"><div className="pdf-icon">PDF</div><div><strong>JPS RFP 1025947</strong><small>{selected.source} · p. {selected.page}</small></div><button>↗</button></div>
-            <label>Source passage</label><blockquote>“{selected.quote}”</blockquote>
-            <label htmlFor="normalized">Normalized requirement</label><textarea id="normalized" defaultValue={selected.text} rows={5}/>
-            <div className="two-col"><div><label>Criticality</label><button className="selectlike">{selected.criticality}⌄</button></div><div><label>Category</label><button className="selectlike">{selected.category}⌄</button></div></div>
-            <label>Technical attributes</label><div className="tag-editor">{selected.tags.map(t=><span key={t}>{t} ×</span>)}<button>+ Add</button></div>
-            <div className="ai-note"><span>✦</span><div><strong>Extraction note</strong><p>The phrase “minimum of” was preserved because it changes how product capability is evaluated.</p></div></div>
-            <label htmlFor="feedback">Engineer feedback</label><textarea id="feedback" value={note} onChange={(e)=>setNote(e.target.value)} rows={3} placeholder="Add reasoning, corrections, or a review note…"/>
-            <div className="review-actions"><button className="flag" onClick={()=>act('Requirement flagged for clarification')}>⚑ Flag</button><button className="secondary" onClick={()=>act('Draft saved to the audit trail')}>Save edit</button><button className="approve" onClick={()=>act('Requirement approved for product matching')}>✓ Approve</button></div>
-          </aside>
-        </div>}
-      </section>
-      {toast && <div className="toast">✓ {toast}</div>}
-    </main>
-  );
+      {stage===4&&<section className="live-content"><div className="live-title"><span>Final output</span><h2>Export the live analysis</h2><p>Exports are generated from the persisted requirements and compliance decisions—not from sample records.</p></div><div className="output-live"><article><span>CSV</span><h3>Compliance matrix</h3><p>{assessments.length} evidence-backed decisions with products, rationale and confidence.</p><button disabled={!assessments.length} onClick={()=>downloadCsv(requirements,assessments)}>Download compliance CSV</button></article><article><span>JSON</span><h3>Solution package</h3><p>Machine-readable BOM, cohesion checks, assumptions and deviations.</p><button disabled={!solution} onClick={()=>solution&&downloadJson(solution)}>Download solution JSON</button></article></div></section>}
+    </section>
+    {selected&&<div className="review-drawer"><div className="drawer-head"><div><small>{selected.requirement_key} · {selected.section}</small><h3>Edit requirement</h3></div><button aria-label="Close requirement editor" onClick={()=>setSelected(null)}>×</button></div><div className="drawer-classification"><span>{selected.solution_package}</span><span>{selected.subcategory}</span><span>{selected.lifecycle_phase}</span></div><label>Compliance object</label><p className="drawer-object">{selected.compliance_object}</p><label>Expected compliance evidence</label><p className="drawer-evidence">{selected.expected_evidence}</p><label>Normalized requirement</label><textarea rows={5} value={selected.requirement_text} onChange={e=>setSelected({...selected,requirement_text:e.target.value})}/><label>Exact source quotation</label><blockquote>“{selected.source_quote}”<small>Page {selected.page_number??'not returned'}</small></blockquote><label>Optional change note</label><textarea rows={3} value={note} onChange={e=>setNote(e.target.value)} placeholder="Explain the correction for the audit trail"/><div className="drawer-actions"><button onClick={()=>setSelected(null)}>Cancel</button><button className="approve-live" disabled={!selected.requirement_text.trim()||!!busy} onClick={()=>saveRequirement(selected)}>Save changes</button></div></div>}
+  </main>
 }
 
-function StageWorkspace({stage,onAction}:{stage:0|2|3|4;onAction:(message:string)=>void}) {
-  const copy = stageContent[stage];
-  const [fileName,setFileName] = useState('');
-  if(stage===0) return <div className="stage-page"><div className="wide-head"><span className="eyebrow">{copy.eyebrow}</span><h2>{copy.title}</h2><p>{copy.body}</p></div><div className="intake-grid"><section className="drop-card"><span className="upload-glyph">⇧</span><h3>Customer RFQ or specification</h3><p>PDF or DOCX, up to 100 MB. Scanned documents are supported.</p><label className="primary upload-button">Choose RFQ<input type="file" accept=".pdf,.doc,.docx" onChange={async(e)=>{const f=e.target.files?.[0];if(!f)return;setFileName(f.name);const body=new FormData();body.append('file',f);try{const response=await fetch('/api/files',{method:'POST',body});if(!response.ok)throw new Error();onAction(`${f.name} uploaded and queued for extraction`)}catch{onAction(`${f.name} added locally; cloud storage will connect on publish`)}}}/></label>{fileName&&<strong className="file-ready">✓ {fileName}</strong>}</section><section className="source-stack"><h3>Evidence sources</h3><div className="evidence-row"><span>PDF</span><div><strong>JPS RFP 1025947</strong><small>118 pages · Customer source</small></div><i>Ready</i></div><div className="evidence-row"><span>GE</span><div><strong>Multilin 850 feeder relay manual</strong><small>Product evidence · Public manual</small></div><i>Indexed</i></div><div className="evidence-row"><span>GE</span><div><strong>Multilin L90 line differential manual</strong><small>Product evidence · Public manual</small></div><i>Indexed</i></div><button className="secondary full" onClick={()=>onAction('Product manual source added')}>+ Add product manual or catalog URL</button></section></div><div className="control-note"><strong>Controlled automation</strong><p>Extraction is deterministic where possible: document parsing, tables, units, clause numbering, and deduplication run as code. A model is used only to normalize technical meaning and must cite its source span. Nothing advances without an engineer checkpoint.</p></div></div>;
-  if(stage===2) return <div className="stage-page"><div className="wide-head"><span className="eyebrow">{copy.eyebrow}</span><h2>{copy.title}</h2><p>{copy.body}</p></div><div className="summary-strip"><div><b>64</b><span>requirements</span></div><div><b className="green">51</b><span>compliant</span></div><div><b className="amber">8</b><span>conditional</span></div><div><b className="red">5</b><span>non-compliant</span></div></div><div className="decision-grid"><ComplianceCard id="REQ-069-015" status="Compliant" product="GE Multilin D60" detail="Five zones of phase and ground distance; POTT logic supported." evidence="D60 Instruction Manual, Ch. 5, pp. 5-142–5-166" onAction={onAction}/><ComplianceCard id="REQ-069-018" status="Compliant" product="GE Multilin D60" detail="DNP3 serial and Ethernet are available; point mapping requires engineering." evidence="D60 Communications Guide, pp. 3-21–3-38" onAction={onAction}/><ComplianceCard id="REQ-069-022" status="Conditional" product="Panel assembly" detail="Relay rating is adequate; salt-laden atmosphere requires a sealed, climate-controlled enclosure." evidence="D60 Technical Specifications + panel design rule ENV-04" onAction={onAction}/><ComplianceCard id="REQ-069-027" status="Alternate" product="ABB FT-1 switches" detail="Catalog panel package defaults to test blocks. FT-1 switches are offered as a compliant substitution." evidence="FT-1 catalog sheet, table 2" onAction={onAction}/></div></div>;
-  if(stage===3) return <div className="stage-page"><div className="wide-head"><span className="eyebrow">{copy.eyebrow}</span><h2>{copy.title}</h2><p>{copy.body}</p></div><div className="solution-grid"><section className="bom"><h3>Recommended protection panel</h3>{[['Primary A relay','GE Multilin D60','1'],['Primary B relay','GE Multilin D60','1'],['Test switches','ABB FT-1','12'],['Managed Ethernet switch','GE ML3000','1'],['Panel enclosure','NEMA 12, climate controlled','1'],['Engineering & FAT','Configured service package','1']].map(([type,item,qty])=><div className="bom-row" key={type}><span>✓</span><div><small>{type}</small><strong>{item}</strong></div><b>× {qty}</b></div>)}</section><section className="cohesion"><h3>System cohesion checks</h3>{[['DC burden','Pass','6.2 A peak vs 20 A supply'],['CT secondary circuits','Pass','1 A inputs; shorting test switches included'],['Time synchronization','Pass','IRIG-B and SNTP architecture aligned'],['Protocol mapping','Review','DNP3 point list requires customer confirmation'],['Panel environment','Resolved','Thermostat, heater and filtered cooling added']].map(([name,status,detail])=><div className="check-row" key={name}><i className={status==='Review'?'warn':''}>{status==='Review'?'!':'✓'}</i><div><strong>{name}</strong><small>{detail}</small></div><b>{status}</b></div>)}<label>Engineer decision note</label><textarea rows={4} defaultValue="Confirm customer preference for copper versus fiber communications between panel and station LAN."/><button className="approve full" onClick={()=>onAction('Cohesive solution approved for output generation')}>✓ Approve cohesive solution</button></section></div></div>;
-  return <div className="stage-page"><div className="wide-head"><span className="eyebrow">{copy.eyebrow}</span><h2>{copy.title}</h2><p>{copy.body}</p></div><div className="outputs-grid">{[['Compliance matrix','XLSX','64 requirements with evidence and decisions'],['Technical proposal','DOCX','Solution narrative, scope and assumptions'],['Bill of material','XLSX','Configured equipment and quantities'],['Deviation schedule','DOCX','5 exceptions and proposed resolutions'],['Evidence package','ZIP','Cited manual pages and audit trail'],['Executive summary','PDF','Bid status and commercial handoff']].map(([title,type,description],i)=><article key={title}><span>{type}</span><h3>{title}</h3><p>{description}</p><small>{i<4?'Ready':'Pending final approval'}</small><button onClick={()=>onAction(`${title} export prepared`)}>Download ↓</button></article>)}</div><div className="approval-bar"><div><strong>Final gate</strong><p>4 checkpoints completed · 2 outputs awaiting final engineer approval</p></div><button className="approve" onClick={()=>onAction('Bid package approved and audit snapshot sealed')}>Approve & seal bid package</button></div></div>;
+type SubcategoryGroup={name:string;order:number;requirements:Requirement[]};
+type PackageGroup={name:string;order:number;requirements:Requirement[];subcategories:SubcategoryGroup[]};
+
+function groupRequirements(requirements:Requirement[]):PackageGroup[]{
+  const packages=new Map<string,Requirement[]>();
+  for(const requirement of requirements){
+    const name=requirement.solution_package||'Generic / Unclassified';
+    packages.set(name,[...(packages.get(name)||[]),requirement]);
+  }
+  return [...packages.entries()].map(([name,items])=>{
+    const subcategories=new Map<string,Requirement[]>();
+    for(const requirement of items){
+      const subcategory=requirement.subcategory||'Generic / Other';
+      subcategories.set(subcategory,[...(subcategories.get(subcategory)||[]),requirement]);
+    }
+    return {name,order:items[0]?.package_order||99,requirements:items,subcategories:[...subcategories.entries()].map(([subcategory,subcategoryItems])=>({name:subcategory,order:subcategoryItems[0]?.subcategory_order||99,requirements:subcategoryItems})).sort((a,b)=>a.order-b.order)};
+  }).sort((a,b)=>a.order-b.order);
 }
 
-function ComplianceCard({id,status,product,detail,evidence,onAction}:{id:string;status:string;product:string;detail:string;evidence:string;onAction:(m:string)=>void}) { return <article className="compliance-card"><div className="card-top"><b>{id}</b><i className={status==='Compliant'?'pass':status==='Conditional'?'condition':'alternate'}>{status}</i></div><small>Recommended offering</small><h3>{product}</h3><p>{detail}</p><div className="evidence"><span>↳</span><div><small>Evidence</small><strong>{evidence}</strong></div></div><label>Engineer feedback</label><textarea rows={2} placeholder="Record rationale or request more evidence…"/><div className="card-actions"><button onClick={()=>onAction(`${id}: more evidence requested`)}>Request evidence</button><button className="approve" onClick={()=>onAction(`${id}: decision approved`)}>Approve</button></div></article> }
+function RequirementsWorkspace({requirements,packageGroups,activePackage,subcategoryPages,onSelectPackage,onSetPage,onEdit,onContinue}:{requirements:Requirement[];packageGroups:PackageGroup[];activePackage:PackageGroup|null;subcategoryPages:Record<string,number>;onSelectPackage:(name:string)=>void;onSetPage:(key:string,page:number)=>void;onEdit:(requirement:Requirement)=>void;onContinue:()=>void}){
+  return <section className="live-content requirements-content">
+    <div className="live-title"><span>Engineer checkpoint 1</span><h2>Review the requirement story</h2><p>Requirements are ordered as a cohesive solution narrative. Editing is optional; the compliance route shown on each item determines whether the next stage looks for a product manual, system design, deliverable, or test record.</p></div>
+    {requirements.length===0?<Empty text="Upload an RFQ and run extraction first."/>:<div className="cohesive-browser">
+      <aside className="package-browser-nav"><small>Solution packages</small>{packageGroups.map(group=><button key={group.name} className={activePackage?.name===group.name?'active':''} onClick={()=>onSelectPackage(group.name)}><i>{String(group.order).padStart(2,'0')}</i><span>{group.name}</span><b>{group.requirements.length}</b></button>)}</aside>
+      {activePackage&&<div className="package-browser-main">
+        <div className="package-breadcrumb">Requirements / Package {String(activePackage.order).padStart(2,'0')}</div>
+        <div className="package-heading"><div><span>Solution package</span><h3>{activePackage.name}</h3><p>{activePackage.requirements.length} requirements arranged through {activePackage.subcategories.length} engineering chapters.</p></div><div><b>{activePackage.requirements.length}</b><small>requirements</small></div></div>
+        <div className="package-meta"><span>Products</span><span>System design</span><span>Services &amp; deliverables</span><span>Verification</span></div>
+        <div className="requirement-chapters">{activePackage.subcategories.map((subcategory,index)=>{
+          const key=`${activePackage.name}:${subcategory.name}`;
+          const pages=Math.max(1,Math.ceil(subcategory.requirements.length/SUBCATEGORY_PAGE_SIZE));
+          const page=Math.min(subcategoryPages[key]||1,pages);
+          const visible=subcategory.requirements.slice((page-1)*SUBCATEGORY_PAGE_SIZE,page*SUBCATEGORY_PAGE_SIZE);
+          return <details key={subcategory.name} open={index<2}><summary><span><i>{activePackage.order}.{index+1}</i><strong>{subcategory.name}</strong></span><b>{subcategory.requirements.length}</b></summary><div className="chapter-requirements">{visible.map(requirement=><button className="cohesive-requirement-row" key={requirement.id} onClick={()=>onEdit(requirement)}><div className="cohesive-row-head"><span>{requirement.requirement_key}</span><i>{requirement.requirement_type}</i><i>{requirement.lifecycle_phase}</i><b>Edit</b></div><strong>{requirement.requirement_text}</strong><div className="cohesive-row-meta"><span>{requirement.compliance_object}</span><span>Page {requirement.page_number??'—'}</span><span className={`evidence-scope ${requirement.evidence_scope}`}>{requirement.expected_evidence}</span></div></button>)}</div>{pages>1&&<div className="chapter-pagination"><button disabled={page===1} onClick={event=>{event.preventDefault();onSetPage(key,page-1)}}>← Previous</button><span>{(page-1)*SUBCATEGORY_PAGE_SIZE+1}–{Math.min(page*SUBCATEGORY_PAGE_SIZE,subcategory.requirements.length)} of {subcategory.requirements.length}</span><button disabled={page===pages} onClick={event=>{event.preventDefault();onSetPage(key,page+1)}}>Next →</button></div>}</details>
+        })}</div>
+        <div className="requirement-footer"><span className="classification-note">Classification is deterministic and recalculated whenever a requirement is edited.</span><button className="run-button" onClick={onContinue}>Continue to compliance →</button></div>
+      </div>}
+    </div>}
+  </section>
+}
+
+type ComplianceLane='all'|'product'|'design'|'deliverable'|'testing'|'engineer';
+
+function complianceLane(requirement:Requirement|undefined):ComplianceLane{
+  if(!requirement)return 'engineer';
+  if(requirement.evidence_scope==='system_design')return 'design';
+  if(requirement.evidence_scope==='engineering_deliverable')return 'deliverable';
+  if(requirement.evidence_scope==='test_report')return 'testing';
+  if(requirement.evidence_scope==='engineer_confirmation')return 'engineer';
+  return 'product';
+}
+
+function displayComplianceStatus(assessment:Assessment,requirement:Requirement|undefined){
+  const lane=complianceLane(requirement);
+  if(lane==='design')return {label:'Design evidence required',tone:'pending'};
+  if(lane==='deliverable')return {label:'Deliverable required',tone:'pending'};
+  if(lane==='testing')return {label:'Test evidence required',tone:'pending'};
+  if(lane==='engineer')return {label:'Engineer review required',tone:'pending'};
+  if(assessment.decision==='Unknown'){
+    if(assessment.evaluation_method==='deterministic-no-evidence')return {label:'Evidence insufficient',tone:'unresolved'};
+    return {label:'Technical review required',tone:'unresolved'};
+  }
+  return {label:assessment.decision,tone:assessment.decision.toLowerCase().replace(' ','-')};
+}
+
+function ComplianceWorkspace({requirements,assessments,complianceJob,extractionReady,manualsCount,busy,configured,assessmentPage,onSetPage,onStartCompliance,onReturnSources,onBuildSolution}:{requirements:Requirement[];assessments:Assessment[];complianceJob:ComplianceJob|null;extractionReady:boolean;manualsCount:number;busy:boolean;configured:boolean;assessmentPage:number;onSetPage:(page:number|((current:number)=>number))=>void;onStartCompliance:(force?:boolean)=>void;onReturnSources:()=>void;onBuildSolution:()=>void}){
+  const [lane,setLane]=useState<ComplianceLane>('all');
+  const [expandedAssessment,setExpandedAssessment]=useState<string|null>(null);
+  const requirementById=useMemo(()=>new Map(requirements.map(requirement=>[requirement.id,requirement])),[requirements]);
+  const orderedRows=useMemo(()=>assessments.map(assessment=>({assessment,requirement:requirementById.get(assessment.requirement_id)})).sort((left,right)=>{
+    const leftRequirement=left.requirement;const rightRequirement=right.requirement;
+    return (leftRequirement?.package_order??99)-(rightRequirement?.package_order??99)
+      ||(leftRequirement?.subcategory_order??99)-(rightRequirement?.subcategory_order??99)
+      ||(leftRequirement?.page_number??9999)-(rightRequirement?.page_number??9999)
+      ||(leftRequirement?.requirement_key??'').localeCompare(rightRequirement?.requirement_key??'');
+  }),[assessments,requirementById]);
+  const laneCounts=useMemo(()=>orderedRows.reduce<Record<ComplianceLane,number>>((counts,row)=>{counts.all+=1;counts[complianceLane(row.requirement)]+=1;return counts},{all:0,product:0,design:0,deliverable:0,testing:0,engineer:0}),[orderedRows]);
+  const filteredRows=lane==='all'?orderedRows:orderedRows.filter(row=>complianceLane(row.requirement)===lane);
+  const pages=Math.max(1,Math.ceil(filteredRows.length/ASSESSMENTS_PER_PAGE));
+  const displayPage=Math.min(assessmentPage,pages);
+  const visibleRows=filteredRows.slice((displayPage-1)*ASSESSMENTS_PER_PAGE,displayPage*ASSESSMENTS_PER_PAGE);
+  const productRows=orderedRows.filter(row=>complianceLane(row.requirement)==='product');
+  const compliant=productRows.filter(row=>row.assessment.decision==='Compliant').length;
+  const exceptions=productRows.filter(row=>['Conditional','Non-compliant'].includes(row.assessment.decision)).length;
+  const unresolved=productRows.filter(row=>row.assessment.decision==='Unknown').length;
+  const evidenceDue=orderedRows.length-productRows.length;
+  const lanes:Array<{id:ComplianceLane;label:string}>=[{id:'all',label:'All results'},{id:'product',label:'Product compliance'},{id:'design',label:'System design'},{id:'deliverable',label:'Deliverables'},{id:'testing',label:'Testing'},{id:'engineer',label:'Engineer review'}];
+  const selectLane=(nextLane:ComplianceLane)=>{setLane(nextLane);onSetPage(1);setExpandedAssessment(null)};
+  return <section className="live-content"><div className="live-title"><span>Engineer checkpoint 2</span><h2>Validate evidence against the right compliance object</h2><p>Product capabilities use indexed manuals and controlled model evaluation. System design, supplier deliverables, and verification requirements are routed to their required engineering evidence without unnecessary model calls. Fireworks is reserved for explicit conflicts and consequential non-compliance.</p></div>
+    {complianceJob&&<div className={`compliance-progress ${complianceJob.status}`}><div><strong>{complianceJob.stale?'Requirements or manuals changed — re-evaluation required':complianceJob.status==='completed'?'Controlled compliance complete':complianceJob.status==='failed'?'Compliance paused after a batch failure':complianceJob.status==='interrupted'?'Compliance interrupted — checkpoints preserved':'Controlled compliance is running'}</strong><small>{complianceJob.completed_requirements} of {complianceJob.total_requirements} requirements complete · {complianceJob.deterministic_unknowns} deterministic/routed · {complianceJob.ollama_evaluations} Ollama · {complianceJob.fireworks_escalations} Fireworks escalations</small>{complianceJob.error&&<em>{complianceJob.error}</em>}</div><div className="progress-value"><b>{complianceJob.progress_percent}%</b><span><i style={{width:`${complianceJob.progress_percent}%`}}></i></span></div></div>}
+    {assessments.length===0?<><Empty text={!extractionReady?'Wait for the current requirement extraction to complete.':manualsCount?(complianceJob&&['queued','running'].includes(complianceJob.status)?'The first checkpointed decisions will appear here shortly.':'Run controlled compliance for all extracted requirements.'):'Add at least one product manual before compliance analysis.'}/>{manualsCount&&(!complianceJob||complianceJob.stale||['failed','interrupted','completed'].includes(complianceJob.status))?<button className="run-button" disabled={busy||!configured||!requirements.length||!extractionReady} onClick={()=>onStartCompliance(false)}>{complianceJob?.stale?'Start updated compliance':complianceJob&&['failed','interrupted'].includes(complianceJob.status)?'Resume failed batches':`Evaluate all ${requirements.length} requirements`} →</button>:!manualsCount?<button className="run-button" onClick={onReturnSources}>Return to Sources →</button>:null}</>:<><div className="compliance-summary" aria-label="Compliance result summary"><div><small>Product compliant</small><b>{compliant}</b></div><div><small>Product exceptions</small><b>{exceptions}</b></div><div><small>Product unresolved</small><b>{unresolved}</b></div><div><small>Engineering evidence due</small><b>{evidenceDue}</b></div><div className={complianceJob?.failed_batches?'has-failures':''}><small>Batch failures</small><b>{complianceJob?.failed_batches||0}</b></div></div>
+    <div className="compliance-lanes" role="tablist" aria-label="Compliance evidence lanes">{lanes.map(item=><button key={item.id} role="tab" aria-selected={lane===item.id} onClick={()=>selectLane(item.id)}>{item.label}<b>{laneCounts[item.id]}</b></button>)}</div>
+    <div className="compact-compliance-meta"><span><b>{filteredRows.length}</b> results · ordered by package, subcategory and RFQ page</span><span>Showing {filteredRows.length?(displayPage-1)*ASSESSMENTS_PER_PAGE+1:0}–{Math.min(displayPage*ASSESSMENTS_PER_PAGE,filteredRows.length)}</span></div>
+    <div className="compact-compliance-table"><table><thead><tr><th>Req.</th><th>Package / category</th><th>Requirement</th><th>Status</th><th>Evidence / route</th><th><span className="sr-only">Details</span></th></tr></thead><tbody>{visibleRows.map(({assessment,requirement})=>{
+      const status=displayComplianceStatus(assessment,requirement);const isExpanded=expandedAssessment===assessment.id;const evidence=assessment.evidence[0];
+      return <Fragment key={assessment.id}><tr><td className="compact-req">{requirement?.requirement_key||'Requirement'}</td><td className="compact-package"><b>{requirement?.solution_package||'Unclassified'}</b><small>{requirement?.subcategory||'Other'}</small></td><td className="compact-clause"><b>{requirement?.requirement_text||'Requirement text unavailable'}</b><small>{requirement?.criticality||'—'} · Page {requirement?.page_number??'—'}</small></td><td><span className={`compact-status ${status.tone}`}>{status.label}</span></td><td className="compact-source">{evidence?<><b>{evidence.file_name}</b><small>{evidence.location}</small></>:<><b>{requirement?.expected_evidence||'Engineering evidence'}</b><small>{assessment.evaluation_method.replaceAll('-',' ')}</small></>}</td><td><button className="compact-expand" aria-expanded={isExpanded} aria-label={`${isExpanded?'Collapse':'Expand'} ${requirement?.requirement_key||'requirement'} details`} onClick={()=>setExpandedAssessment(isExpanded?null:assessment.id)}>{isExpanded?'▴':'▾'}</button></td></tr>{isExpanded&&<tr className="compact-detail"><td colSpan={6}><div><section><strong>Technical rationale</strong><p>{assessment.rationale}</p>{assessment.alternate&&<p className="compact-alternate"><b>Alternate: {assessment.alternate.product_name}</b> — {assessment.alternate.rationale}</p>}</section><section><strong>{assessment.evidence.length?'Verified evidence':`Expected evidence: ${requirement?.expected_evidence||'Engineer confirmation'}`}</strong>{assessment.evidence.length?assessment.evidence.map((item,index)=><blockquote key={index}>“{item.quote}”<small>{item.file_name} · {item.location}</small></blockquote>):<p>{requirement?.manual_match_applicable?'No product passage passed the controlled evidence gates.':'Supply the routed engineering evidence to complete this determination.'}</p>}<small>{assessment.confidence}% evaluation confidence · {assessment.evaluation_method.replaceAll('-',' ')}</small></section></div></td></tr>}</Fragment>})}</tbody></table></div>
+    <div className="requirement-footer"><div className="pagination"><button disabled={displayPage===1} onClick={()=>onSetPage(page=>Math.max(1,page-1))}>← Previous</button><span>Page <b>{displayPage}</b> of {pages}</span><button disabled={displayPage===pages} onClick={()=>onSetPage(page=>Math.min(pages,page+1))}>Next →</button></div>{complianceJob?.status==='completed'&&!complianceJob.stale?<div className="compliance-actions"><button className="run-button secondary" disabled={busy} onClick={()=>onStartCompliance(true)}>Re-evaluate</button><button className="run-button" disabled={busy||!configured} onClick={onBuildSolution}>Build cohesive solution →</button></div>:complianceJob?.stale?<button className="run-button" disabled={busy} onClick={()=>onStartCompliance(false)}>Start updated compliance →</button>:complianceJob&&['failed','interrupted'].includes(complianceJob.status)?<button className="run-button" disabled={busy} onClick={()=>onStartCompliance(false)}>Resume failed batches →</button>:null}</div></>}
+  </section>
+}
+
+function UploadCard({title,description,action,disabled,onFile}:{title:string;description:string;action:string;disabled:boolean;onFile:(f:File)=>void}){return <article className="upload-live"><span>PDF</span><h3>{title}</h3><p>{description}</p><label className={disabled?'disabled':''}>{action}<input type="file" accept="application/pdf" disabled={disabled} onChange={e=>{const f=e.target.files?.[0];if(f)onFile(f);e.target.value=''}}/></label></article>}
+function Empty({text}:{text:string}){return <div className="empty-live"><span>◇</span><strong>{text}</strong><small>The pipeline will populate this area after the preceding step completes.</small></div>}
+function downloadCsv(reqs:Requirement[],items:Assessment[]){const esc=(v:unknown)=>`"${String(v??'').replaceAll('"','""')}"`;const rows=[['Requirement','Solution package','Subcategory','Compliance object','Requirement type','Lifecycle phase','Expected evidence','Text','Decision','Product','Rationale','Evidence','Confidence'],...items.map(a=>{const r=reqs.find(x=>x.id===a.requirement_id);return[r?.requirement_key||a.requirement_id,r?.solution_package||'',r?.subcategory||'',r?.compliance_object||'',r?.requirement_type||'',r?.lifecycle_phase||'',r?.expected_evidence||'',r?.requirement_text||'',a.decision,a.product_name,a.rationale,a.evidence.map(e=>`${e.file_name}: ${e.quote}`).join(' | '),a.confidence]})];download('gridspec-compliance.csv',rows.map(r=>r.map(esc).join(',')).join('\n'),'text/csv')}
+function downloadJson(data:unknown){download('gridspec-solution.json',JSON.stringify(data,null,2),'application/json')}
+function download(name:string,content:string,type:string){const url=URL.createObjectURL(new Blob([content],{type}));const a=document.createElement('a');a.href=url;a.download=name;a.click();URL.revokeObjectURL(url)}

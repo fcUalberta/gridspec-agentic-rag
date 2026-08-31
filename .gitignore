@@ -10,6 +10,8 @@
 
 # testing
 /coverage
+.pytest_cache/
+.ruff_cache/
 
 # next.js
 /.next/
@@ -28,6 +30,8 @@ yarn-error.log*
 
 # local environment
 .env*
+!.env.example
+!backend/.env.example
 
 # deployment and generated files
 .vercel
@@ -36,3 +40,10 @@ next-env.d.ts
 /.wrangler/
 /outputs/
 /work/
+/data/
+/backend/data/
+/backend/.venv/
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]

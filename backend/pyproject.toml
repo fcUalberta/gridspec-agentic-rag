@@ -1,0 +1,33 @@
+[project]
+name = "gridspec-pipeline"
+version = "0.1.0"
+description = "Real RFQ compliance pipeline using LangGraph, LangChain, Fireworks AI, and MCP"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+  "fastapi>=0.116,<1",
+  "uvicorn[standard]>=0.35,<1",
+  "python-multipart>=0.0.20,<1",
+  "pydantic-settings>=2.10,<3",
+  "pymupdf>=1.28,<2",
+  "liteparse>=2.14,<3",
+  "langgraph>=0.6,<2",
+  "langchain>=0.3,<2",
+  "langchain-fireworks>=0.3,<2",
+  "langchain-ollama>=0.3,<2",
+  "langchain-text-splitters>=0.3,<2",
+  "mcp>=1.14,<2",
+  "qdrant-client>=1.15,<2",
+  "httpx>=0.28,<1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<9", "ruff>=0.12,<1"]
+
+[tool.ruff]
+line-length = 110
+
+[tool.ruff.lint]
+ignore = ["B008", "BLE001"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
