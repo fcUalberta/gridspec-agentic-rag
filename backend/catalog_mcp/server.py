@@ -2,7 +2,6 @@ import uuid
 
 from langchain_fireworks import FireworksEmbeddings
 from mcp.server.fastmcp import FastMCP
-from openai import OpenAI
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, PointStruct, VectorParams
 
@@ -19,15 +18,8 @@ mcp = FastMCP(
 )
 qdrant = QdrantClient(path=settings.qdrant_path)
 embeddings = FireworksEmbeddings(model=settings.fireworks_embedding_model, api_key=settings.fireworks_api_key)
-# langchain-fireworks creates an OpenAI-compatible client without an explicit
-# request bound. Replace it with a bounded client so one provider-side request
-# cannot wedge the entire synchronous MCP worker indefinitely.
-embeddings.client = OpenAI(
-    api_key=settings.fireworks_api_key,
-    base_url="https://api.fireworks.ai/inference/v1",
-    timeout=30.0,
-    max_retries=2,
-)
+# Bound provider requests so one call cannot wedge the synchronous MCP worker.
+embeddings.client = embeddings.client.with_options(timeout=30.0, max_retries=2)
 
 
 def ensure_collection(vector_size: int) -> None:
